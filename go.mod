@@ -9,5 +9,6 @@ require (
 	github.com/prometheus/common v0.12.0
 	github.com/stretchr/testify v1.6.0
 	go.opencensus.io v0.22.3
+	go.uber.org/zap v1.14.1
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 )
