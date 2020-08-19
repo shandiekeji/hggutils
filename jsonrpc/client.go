@@ -6,25 +6,28 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"reflect"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+	logging "github.com/ipfs/go-log/v2"
 	"go.opencensus.io/trace"
 	"go.opencensus.io/trace/propagation"
 	"golang.org/x/xerrors"
 )
 
 const (
-	methodRetryFrequency = time.Second * 3
+	methodMinRetryDelay = 100 * time.Millisecond
+	methodMaxRetryDelay = 10 * time.Minute
 )
 
 var (
 	errorType   = reflect.TypeOf(new(error)).Elem()
 	contextType = reflect.TypeOf(new(context.Context)).Elem()
+
+	log = logging.Logger("rpc")
 )
 
 // ErrClient is an error which occurred on the client side the library
@@ -71,7 +74,8 @@ func NewClient(addr string, namespace string, handler interface{}, requestHeader
 }
 
 type client struct {
-	namespace string
+	namespace     string
+	paramEncoders map[reflect.Type]ParamEncoder
 
 	requests chan clientRequest
 	exiting  <-chan struct{}
@@ -81,7 +85,7 @@ type client struct {
 // NewMergeClient is like NewClient, but allows to specify multiple structs
 // to be filled in the same namespace, using one connection
 func NewMergeClient(addr string, namespace string, outs []interface{}, requestHeader http.Header, opts ...Option) (ClientCloser, error) {
-	var config Config
+	config := defaultConfig()
 	for _, o := range opts {
 		o(&config)
 	}
@@ -92,6 +96,7 @@ func NewMergeClient(addr string, namespace string, outs []interface{}, requestHe
 	}
 
 	if config.proxyConnFactory != nil {
+		// used in tests
 		connFactory = config.proxyConnFactory(connFactory)
 	}
 
@@ -100,8 +105,13 @@ func NewMergeClient(addr string, namespace string, outs []interface{}, requestHe
 		return nil, err
 	}
 
+	if config.noReconnect {
+		connFactory = nil
+	}
+
 	c := client{
-		namespace: namespace,
+		namespace:     namespace,
+		paramEncoders: config.paramEncoders,
 	}
 
 	stop := make(chan struct{})
@@ -109,15 +119,16 @@ func NewMergeClient(addr string, namespace string, outs []interface{}, requestHe
 	c.requests = make(chan clientRequest)
 	c.exiting = exiting
 
-	handlers := map[string]rpcHandler{}
 	go (&wsConn{
-		conn:              conn,
-		connFactory:       connFactory,
-		reconnectInterval: config.ReconnectInterval,
-		handler:           handlers,
-		requests:          c.requests,
-		stop:              stop,
-		exiting:           exiting,
+		conn:             conn,
+		connFactory:      connFactory,
+		reconnectBackoff: config.reconnectBackoff,
+		pingInterval:     config.pingInterval,
+		timeout:          config.timeout,
+		handler:          nil,
+		requests:         c.requests,
+		stop:             stop,
+		exiting:          exiting,
 	}).handleWsConn(context.TODO())
 
 	for _, handler := range outs {
@@ -155,7 +166,6 @@ func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int)
 		// unpack chan type to make sure it's reflect.BothDir
 		ctyp := reflect.ChanOf(reflect.BothDir, ftyp.Out(valOut).Elem())
 		ch := reflect.MakeChan(ctyp, 0) // todo: buffer?
-		chCtx, chCancel := context.WithCancel(ctx)
 		retVal = ch.Convert(ftyp.Out(valOut))
 
 		incoming := make(chan reflect.Value, 32)
@@ -170,7 +180,7 @@ func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int)
 				cases := []reflect.SelectCase{
 					{
 						Dir:  reflect.SelectRecv,
-						Chan: reflect.ValueOf(chCtx.Done()),
+						Chan: reflect.ValueOf(ctx.Done()),
 					},
 					{
 						Dir:  reflect.SelectRecv,
@@ -186,49 +196,58 @@ func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int)
 					})
 				}
 
-				chosen, val, _ := reflect.Select(cases)
+				chosen, val, ok := reflect.Select(cases)
 
 				switch chosen {
 				case 0:
 					ch.Close()
 					return
 				case 1:
-					vvval := val.Interface().(reflect.Value)
-					buf.PushBack(vvval)
-					if buf.Len() > 1 {
-						if buf.Len() > 10 {
-							log.Println("rpc output message buffer", "n", buf.Len())
-						} else {
-							log.Println("rpc output message buffer", "n", buf.Len())
+					if ok {
+						vvval := val.Interface().(reflect.Value)
+						buf.PushBack(vvval)
+						if buf.Len() > 1 {
+							if buf.Len() > 10 {
+								log.Warnw("rpc output message buffer", "n", buf.Len())
+							} else {
+								log.Infow("rpc output message buffer", "n", buf.Len())
+							}
 						}
+					} else {
+						incoming = nil
 					}
 
 				case 2:
 					buf.Remove(front)
+				}
+
+				if incoming == nil && buf.Len() == 0 {
+					ch.Close()
+					return
 				}
 			}
 		}()
 
 		return ctx, func(result []byte, ok bool) {
 			if !ok {
-				chCancel()
+				close(incoming)
 				return
 			}
 
 			val := reflect.New(ftyp.Out(valOut).Elem())
 			if err := json.Unmarshal(result, val.Interface()); err != nil {
-				log.Printf("error unmarshaling chan response: %s", err)
+				log.Errorf("error unmarshaling chan response: %s", err)
 				return
 			}
 
 			if ctx.Err() != nil {
-				log.Printf("got rpc message with cancelled context: %s", ctx.Err())
+				log.Errorf("got rpc message with cancelled context: %s", ctx.Err())
 				return
 			}
 
 			select {
 			case incoming <- val:
-			case <-chCtx.Done():
+			case <-ctx.Done():
 			}
 		}
 	}
@@ -276,7 +295,7 @@ loop:
 			select {
 			case c.requests <- cancelReq:
 			case <-c.exiting:
-				log.Println("failed to send request cancellation, websocket routing exited")
+				log.Warn("failed to send request cancellation, websocket routing exited")
 			}
 		}
 	}
@@ -334,6 +353,16 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 	id := atomic.AddInt64(&fn.client.idCtr, 1)
 	params := make([]param, len(args)-fn.hasCtx)
 	for i, arg := range args[fn.hasCtx:] {
+		enc, found := fn.client.paramEncoders[arg.Type()]
+		if found {
+			// custom param encoder
+			var err error
+			arg, err = enc(arg)
+			if err != nil {
+				return fn.processError(fmt.Errorf("sendRequest failed: %w", err))
+			}
+		}
+
 		params[i] = param{
 			v: arg,
 		}
@@ -373,11 +402,16 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 		}
 	}
 
+	b := backoff{
+		maxDelay: methodMaxRetryDelay,
+		minDelay: methodMinRetryDelay,
+	}
+
 	var resp clientResponse
 	var err error
 	// keep retrying if got a forced closed websocket conn and calling method
 	// has retry annotation
-	for {
+	for attempt := 0; true; attempt++ {
 		resp, err = fn.client.sendRequest(ctx, req, chCtor)
 		if err != nil {
 			return fn.processError(fmt.Errorf("sendRequest failed: %w", err))
@@ -391,8 +425,9 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 			val := reflect.New(fn.ftyp.Out(fn.valOut))
 
 			if resp.Result != nil {
+				log.Debugw("rpc result", "type", fn.ftyp.Out(fn.valOut))
 				if err := json.Unmarshal(resp.Result, val.Interface()); err != nil {
-					log.Println("unmarshaling failed message: ", string(resp.Result))
+					log.Warnw("unmarshaling failed", "message", string(resp.Result))
 					return fn.processError(xerrors.Errorf("unmarshaling result: %w", err))
 				}
 			}
@@ -403,7 +438,8 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 		if !retry {
 			break
 		}
-		time.Sleep(methodRetryFrequency)
+
+		time.Sleep(b.next(attempt))
 	}
 
 	return fn.processResponse(resp, retVal())

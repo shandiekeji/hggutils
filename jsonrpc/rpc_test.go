@@ -2,11 +2,14 @@ package jsonrpc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,9 +17,14 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func init() {
+	logging.SetLogLevel("rpc", "DEBUG")
+}
 
 type SimpleServerHandler struct {
 	n int
@@ -59,6 +67,67 @@ func (h *SimpleServerHandler) StringMatch(t TestType, i2 int64) (out TestOut, er
 	return
 }
 
+func TestReconnection(t *testing.T) {
+	var rpcClient struct {
+		Add func(int) error
+	}
+
+	rpcHandler := SimpleServerHandler{}
+
+	rpcServer := NewServer()
+	rpcServer.Register("SimpleServerHandler", &rpcHandler)
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	// capture connection attempts for this duration
+	captureDuration := 3 * time.Second
+
+	// run the test until the timer expires
+	timer := time.NewTimer(captureDuration)
+
+	// record the number of connection attempts during this test
+	connectionAttempts := 1
+
+	closer, err := NewMergeClient("ws://"+testServ.Listener.Addr().String(), "SimpleServerHandler", []interface{}{&rpcClient}, nil, func(c *Config) {
+		c.proxyConnFactory = func(f func() (*websocket.Conn, error)) func() (*websocket.Conn, error) {
+			return func() (*websocket.Conn, error) {
+				defer func() {
+					connectionAttempts++
+				}()
+
+				if connectionAttempts > 1 {
+					return nil, errors.New("simulates a failed reconnect attempt")
+				}
+
+				c, err := f()
+				if err != nil {
+					return nil, err
+				}
+
+				// closing the connection here triggers the reconnect logic
+				_ = c.Close()
+
+				return c, nil
+			}
+		}
+	})
+	require.NoError(t, err)
+	defer closer()
+
+	// let the JSON-RPC library attempt to reconnect until the timer runs out
+	<-timer.C
+
+	// do some math
+	attemptsPerSecond := int64(connectionAttempts) / int64(captureDuration/time.Second)
+
+	assert.Less(t, attemptsPerSecond, int64(50))
+}
+
+func (h *SimpleServerHandler) ErrChanSub(ctx context.Context) (<-chan int, error) {
+	return nil, errors.New("expect to return an error")
+}
+
 func TestRPC(t *testing.T) {
 	// setup server
 
@@ -76,6 +145,7 @@ func TestRPC(t *testing.T) {
 		Add         func(int) error
 		AddGet      func(int) int
 		StringMatch func(t TestType, i2 int64) (out TestOut, err error)
+		ErrChanSub  func(context.Context) (<-chan int, error)
 	}
 	closer, err := NewClient("ws://"+testServ.Listener.Addr().String(), "SimpleServerHandler", &client, nil)
 	require.NoError(t, err)
@@ -110,6 +180,13 @@ func TestRPC(t *testing.T) {
 	require.Equal(t, "8", o.S)
 	require.Equal(t, 8, o.I)
 
+	// ErrChanSub
+	ctx := context.TODO()
+	_, err = client.ErrChanSub(ctx)
+	if err == nil {
+		t.Fatal("expect an err return, but got nil")
+	}
+
 	// Invalid client handlers
 
 	var noret struct {
@@ -140,7 +217,7 @@ func TestRPC(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = erronly.AddGet()
-	if err == nil || err.Error() != "RPC error (-32602): wrong param count" {
+	if err == nil || err.Error() != "RPC error (-32602): wrong param count (method 'SimpleServerHandler.AddGet'): 0 != 1" {
 		t.Error("wrong error:", err)
 	}
 	closer()
@@ -287,7 +364,7 @@ func (h *ChanHandler) Sub(ctx context.Context, i int, eq int) (<-chan int, error
 
 	wait := h.wait
 
-	log.Println("SERVER SUB!")
+	log.Warnf("SERVER SUB!")
 	go func() {
 		defer close(out)
 		var n int
@@ -295,9 +372,10 @@ func (h *ChanHandler) Sub(ctx context.Context, i int, eq int) (<-chan int, error
 		for {
 			select {
 			case <-ctx.Done():
-				fmt.Println("ctxdone1")
+				fmt.Println("ctxdone1", i, eq)
 				return
 			case <-wait:
+				fmt.Println("CONSUMED WAIT: ", i)
 			}
 
 			n += i
@@ -376,18 +454,69 @@ func TestChan(t *testing.T) {
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
-	log.Println("last sub")
+	log.Warnf("last sub")
 	sub, err = client.Sub(ctx, 3, 6)
 	require.NoError(t, err)
 
-	log.Println("waiting for value now")
+	log.Warnf("waiting for value now")
 	require.Equal(t, 3, <-sub)
-	log.Println("not equal")
+	log.Warnf("not equal")
 
 	// close (remote)
 	serverHandler.wait <- struct{}{}
 	_, ok = <-sub
 	require.Equal(t, false, ok)
+}
+
+func TestChanClosing(t *testing.T) {
+	var client struct {
+		Sub func(context.Context, int, int) (<-chan int, error)
+	}
+
+	serverHandler := &ChanHandler{
+		wait: make(chan struct{}, 5),
+	}
+
+	rpcServer := NewServer()
+	rpcServer.Register("ChanHandler", serverHandler)
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	closer, err := NewClient("ws://"+testServ.Listener.Addr().String(), "ChanHandler", &client, nil)
+	require.NoError(t, err)
+
+	defer closer()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+
+	// sub
+
+	sub1, err := client.Sub(ctx1, 2, -1)
+	require.NoError(t, err)
+
+	sub2, err := client.Sub(ctx2, 3, -1)
+	require.NoError(t, err)
+
+	// recv one
+
+	serverHandler.wait <- struct{}{}
+	serverHandler.wait <- struct{}{}
+
+	require.Equal(t, 2, <-sub1)
+	require.Equal(t, 3, <-sub2)
+
+	cancel1()
+
+	require.Equal(t, 0, <-sub1)
+	time.Sleep(time.Millisecond * 50) // make sure the loop has exited (having a shared wait channel makes this annoying)
+
+	serverHandler.wait <- struct{}{}
+	require.Equal(t, 6, <-sub2)
+
+	cancel2()
+	require.Equal(t, 0, <-sub2)
 }
 
 func TestChanServerClose(t *testing.T) {
@@ -506,6 +635,73 @@ func TestServerChanLockClose(t *testing.T) {
 	<-serverHandler.ctxdone
 }
 
+type StreamingHandler struct {
+}
+
+func (h *StreamingHandler) GetData(ctx context.Context, n int) (<-chan int, error) {
+	out := make(chan int)
+
+	go func() {
+		defer close(out)
+
+		for i := 0; i < n; i++ {
+			out <- i
+		}
+	}()
+
+	return out, nil
+}
+
+func TestChanClientReceiveAll(t *testing.T) {
+	var client struct {
+		GetData func(context.Context, int) (<-chan int, error)
+	}
+
+	serverHandler := &StreamingHandler{}
+
+	rpcServer := NewServer()
+	rpcServer.Register("ChanHandler", serverHandler)
+
+	tctx, tcancel := context.WithCancel(context.Background())
+
+	testServ := httptest.NewServer(rpcServer)
+	testServ.Config.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		return tctx
+	}
+
+	closer, err := NewClient("ws://"+testServ.Listener.Addr().String(), "ChanHandler", &client, nil)
+	require.NoError(t, err)
+
+	defer closer()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// sub
+
+	sub, err := client.GetData(ctx, 100)
+	require.NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		select {
+		case v, ok := <-sub:
+			if !ok {
+				t.Fatal("channel closed", i)
+			}
+
+			if v != i {
+				t.Fatal("got wrong value", v, i)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for values")
+		}
+	}
+
+	tcancel()
+	testServ.Close()
+
+}
+
 func TestControlChanDeadlock(t *testing.T) {
 	for r := 0; r < 20; r++ {
 		testControlChanDeadlock(t)
@@ -565,4 +761,65 @@ func testControlChanDeadlock(t *testing.T) {
 	_, err = client.Sub(ctx, 2, -1)
 	require.NoError(t, err)
 	<-done
+}
+
+type InterfaceHandler struct {
+}
+
+func (h *InterfaceHandler) ReadAll(ctx context.Context, r io.Reader) ([]byte, error) {
+	return ioutil.ReadAll(r)
+}
+
+func TestInterfaceHandler(t *testing.T) {
+	var client struct {
+		ReadAll func(ctx context.Context, r io.Reader) ([]byte, error)
+	}
+
+	serverHandler := &InterfaceHandler{}
+
+	rpcServer := NewServer(WithParamDecoder(new(io.Reader), readerDec))
+	rpcServer.Register("InterfaceHandler", serverHandler)
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	closer, err := NewMergeClient("ws://"+testServ.Listener.Addr().String(), "InterfaceHandler", []interface{}{&client}, nil, WithParamEncoder(new(io.Reader), readerEnc))
+	require.NoError(t, err)
+
+	defer closer()
+
+	read, err := client.ReadAll(context.TODO(), strings.NewReader("pooooootato"))
+	require.NoError(t, err)
+	require.Equal(t, "pooooootato", string(read), "potatos weren't equal")
+}
+
+var (
+	readerRegistery   = map[int]io.Reader{}
+	readerRegisteryN  = 31
+	readerRegisteryLk sync.Mutex
+)
+
+func readerEnc(rin reflect.Value) (reflect.Value, error) {
+	reader := rin.Interface().(io.Reader)
+
+	readerRegisteryLk.Lock()
+	defer readerRegisteryLk.Unlock()
+
+	n := readerRegisteryN
+	readerRegisteryN++
+
+	readerRegistery[n] = reader
+	return reflect.ValueOf(n), nil
+}
+
+func readerDec(ctx context.Context, rin []byte) (reflect.Value, error) {
+	var id int
+	if err := json.Unmarshal(rin, &id); err != nil {
+		return reflect.Value{}, err
+	}
+
+	readerRegisteryLk.Lock()
+	defer readerRegisteryLk.Unlock()
+
+	return reflect.ValueOf(readerRegistery[id]), nil
 }

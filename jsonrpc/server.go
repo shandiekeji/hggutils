@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/gorilla/websocket"
@@ -19,13 +19,21 @@ const (
 
 // RPCServer provides a jsonrpc 2.0 http server handler
 type RPCServer struct {
-	methods handlers
+	methods map[string]rpcHandler
+
+	paramDecoders map[reflect.Type]ParamDecoder
 }
 
 // NewServer creates new RPCServer instance
-func NewServer() *RPCServer {
+func NewServer(opts ...ServerOption) *RPCServer {
+	config := defaultServerConfig()
+	for _, o := range opts {
+		o(&config)
+	}
+
 	return &RPCServer{
-		methods: map[string]rpcHandler{},
+		methods:       map[string]rpcHandler{},
+		paramDecoders: config.paramDecoders,
 	}
 }
 
@@ -45,19 +53,19 @@ func (s *RPCServer) handleWS(ctx context.Context, w http.ResponseWriter, r *http
 
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Error(err)
 		w.WriteHeader(500)
 		return
 	}
 
 	(&wsConn{
 		conn:    c,
-		handler: s.methods,
+		handler: s,
 		exiting: make(chan struct{}),
 	}).handleWsConn(ctx)
 
 	if err := c.Close(); err != nil {
-		log.Println(err)
+		log.Error(err)
 		return
 	}
 }
@@ -72,17 +80,17 @@ func (s *RPCServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.methods.handleReader(ctx, r.Body, w, rpcError)
+	s.handleReader(ctx, r.Body, w, rpcError)
 }
 
 func rpcError(wf func(func(io.Writer)), req *request, code int, err error) {
-	log.Printf("RPC Error: %v\n", err)
+	log.Errorf("RPC Error: %s", err)
 	wf(func(w io.Writer) {
 		if hw, ok := w.(http.ResponseWriter); ok {
 			hw.WriteHeader(500)
 		}
 
-		log.Printf("rpc error: %v\n", err)
+		log.Warnf("rpc error: %s", err)
 
 		if req.ID == nil { // notification
 			return
@@ -99,7 +107,7 @@ func rpcError(wf func(func(io.Writer)), req *request, code int, err error) {
 
 		err = json.NewEncoder(w).Encode(resp)
 		if err != nil {
-			log.Printf("failed to write rpc error: %v\n", err)
+			log.Warnf("failed to write rpc error: %s", err)
 			return
 		}
 	})
@@ -109,7 +117,7 @@ func rpcError(wf func(func(io.Writer)), req *request, code int, err error) {
 //
 // Handler is any value with methods defined
 func (s *RPCServer) Register(namespace string, handler interface{}) {
-	s.methods.register(namespace, handler)
+	s.register(namespace, handler)
 }
 
 var _ error = &respError{}
