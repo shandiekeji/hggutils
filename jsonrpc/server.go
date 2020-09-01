@@ -59,9 +59,10 @@ func (s *RPCServer) handleWS(ctx context.Context, w http.ResponseWriter, r *http
 	}
 
 	(&wsConn{
-		conn:    c,
-		handler: s,
-		exiting: make(chan struct{}),
+		conn:        c,
+		noReConnect: true,
+		handler:     s,
+		exiting:     make(chan struct{}),
 	}).handleWsConn(ctx)
 
 	if err := c.Close(); err != nil {

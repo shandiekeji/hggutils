@@ -9,7 +9,6 @@ import (
 	"io"
 	"reflect"
 
-	"gitee.com/huanghua_2017/hggutils/jsonrpc/metrics"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"go.opencensus.io/trace"
@@ -17,6 +16,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/xerrors"
+
+	"gitee.com/huanghua_2017/hggutils/jsonrpc/metrics"
 )
 
 type rpcHandler struct {
