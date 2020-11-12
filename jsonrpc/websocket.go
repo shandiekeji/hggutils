@@ -405,6 +405,9 @@ func (c *wsConn) closeChans() {
 }
 
 func (c *wsConn) handleWsConn(ctx context.Context) {
+	if c.pingInterval <= 0 {
+		c.pingInterval = time.Second * 5
+	}
 	c.inflight = map[int64]clientRequest{}
 	c.handling = map[int64]context.CancelFunc{}
 	c.chanHandlers = map[uint64]func(m []byte, ok bool){}
@@ -450,11 +453,12 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			case <-c.exiting:
 				return
 			case <-ptmr:
-				c.conn.WriteMessage(websocket.BinaryMessage, []byte("ping"))
+				c.conn.WriteMessage(websocket.TextMessage, []byte("ping"))
 			case data := <-c.writeChan:
 				err := c.conn.WriteMessage(websocket.TextMessage, data)
 				if err != nil {
 					log.Errorf("write message error, %v, %v", c.conn.RemoteAddr(), err)
+					once.Do(exitfun)
 					return
 				}
 			case req := <-c.requests:
@@ -485,13 +489,19 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			if c.pingInterval > 0 {
 				c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
 			}
-			mt, data, err := c.conn.ReadMessage()
+			_, data, err := c.conn.ReadMessage()
 			if err != nil {
 				log.Errorf("read message error, %v, %v", c.conn.RemoteAddr(), err)
+				once.Do(exitfun)
 				return
 			}
-			if mt == websocket.BinaryMessage && len(data) == 4 && string(data) == "ping" {
-				continue
+			if len(data) == 4 {
+				if string(data) == "ping" {
+					c.writeChan <- []byte("pong")
+					continue
+				} else if string(data) == "pong" {
+					continue
+				}
 			}
 
 			var frame frame
