@@ -56,8 +56,9 @@ type wsConn struct {
 	stop     <-chan struct{}
 	exiting  chan struct{}
 
-	// 写
-	writeChan chan []byte
+	//
+	writeChan     chan []byte
+	keepAliveChan chan []byte
 
 	// ////
 	// Client related
@@ -374,7 +375,7 @@ func (c *wsConn) handleFrame(ctx context.Context, frame frame) {
 			Jsonrpc: "2.0",
 			Method:  wsPong,
 		})
-		c.writeChan <- msg
+		c.keepAliveChan <- msg
 		log.Infow("ping", "remote", c.conn.RemoteAddr().String())
 	case wsPong:
 		log.Infow("pong", "remote", c.conn.RemoteAddr().String())
@@ -426,6 +427,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	c.handling = map[int64]context.CancelFunc{}
 	c.chanHandlers = map[uint64]func(m []byte, ok bool){}
 	c.writeChan = make(chan []byte, 100)
+	c.keepAliveChan = make(chan []byte, 100)
 	c.registerCh = make(chan outChanReg)
 	c.frameChan = make(chan frame, 100)
 	exitCh := make(chan struct{})
@@ -481,7 +483,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 					Jsonrpc: "2.0",
 					Method:  wsPing,
 				})
-				c.writeChan <- msg
+				c.keepAliveChan <- msg
 			case data := <-c.writeChan:
 				err := c.conn.WriteMessage(websocket.TextMessage, data)
 				if err != nil {
@@ -489,6 +491,14 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 					once.Do(exitfun)
 					return
 				}
+			case data := <-c.keepAliveChan:
+				err := c.conn.WriteMessage(websocket.TextMessage, data)
+				if err != nil {
+					log.Errorf("write ping pong message error, %v, %v", c.conn.RemoteAddr(), err)
+					once.Do(exitfun)
+					return
+				}
+				log.Infow("send", "remote", c.conn.RemoteAddr().String(), "data", string(data))
 			case req := <-c.requests:
 				if req.req.ID != nil {
 					c.inflight[*req.req.ID] = req
