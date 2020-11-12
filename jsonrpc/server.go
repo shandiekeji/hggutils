@@ -2,8 +2,6 @@ package jsonrpc
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -64,11 +62,6 @@ func (s *RPCServer) handleWS(ctx context.Context, w http.ResponseWriter, r *http
 		handler:     s,
 		exiting:     make(chan struct{}),
 	}).handleWsConn(ctx)
-
-	if err := c.Close(); err != nil {
-		log.Error(err)
-		return
-	}
 }
 
 // TODO: return errors to clients per spec
@@ -81,37 +74,30 @@ func (s *RPCServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.handleReader(ctx, r.Body, w, rpcError)
+	erf := func(wrtfun func(interface{}), req *request, code int, err error) {
+		w.WriteHeader(500)
+		rpcError(wrtfun, req, code, err)
+	}
+	s.handleReader(ctx, r.Body, w, erf)
 }
 
-func rpcError(wf func(func(io.Writer)), req *request, code int, err error) {
+func rpcError(wrtfun func(interface{}), req *request, code int, err error) {
 	log.Errorf("RPC Error: %s", err)
-	wf(func(w io.Writer) {
-		if hw, ok := w.(http.ResponseWriter); ok {
-			hw.WriteHeader(500)
-		}
 
-		log.Warnf("rpc error: %s", err)
+	if req.ID == nil { // notification
+		return
+	}
 
-		if req.ID == nil { // notification
-			return
-		}
+	resp := response{
+		Jsonrpc: "2.0",
+		ID:      *req.ID,
+		Error: &respError{
+			Code:    code,
+			Message: err.Error(),
+		},
+	}
 
-		resp := response{
-			Jsonrpc: "2.0",
-			ID:      *req.ID,
-			Error: &respError{
-				Code:    code,
-				Message: err.Error(),
-			},
-		}
-
-		err = json.NewEncoder(w).Encode(resp)
-		if err != nil {
-			log.Warnf("failed to write rpc error: %s", err)
-			return
-		}
-	})
+	wrtfun(resp)
 }
 
 // Register registers new RPC handler
