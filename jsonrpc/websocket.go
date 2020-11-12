@@ -52,8 +52,9 @@ type wsConn struct {
 	requests         <-chan clientRequest
 	frameChan        chan frame
 
-	stop    <-chan struct{}
-	exiting chan struct{}
+	isClient bool
+	stop     <-chan struct{}
+	exiting  chan struct{}
 
 	// 写
 	writeChan chan []byte
@@ -374,7 +375,9 @@ func (c *wsConn) handleFrame(ctx context.Context, frame frame) {
 			Method:  wsPong,
 		})
 		c.writeChan <- msg
+		log.Infow("ping", "remote", c.conn.RemoteAddr().String())
 	case wsPong:
+		log.Infow("pong", "remote", c.conn.RemoteAddr().String())
 		return
 	case chValue:
 		c.handleChanMessage(frame)
@@ -417,7 +420,7 @@ func (c *wsConn) closeChans() {
 
 func (c *wsConn) handleWsConn(ctx context.Context) {
 	if c.pingInterval <= 0 {
-		c.pingInterval = time.Second * 5
+		c.pingInterval = time.Second * 10
 	}
 	c.inflight = map[int64]clientRequest{}
 	c.handling = map[int64]context.CancelFunc{}
@@ -425,24 +428,27 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	c.writeChan = make(chan []byte, 100)
 	c.registerCh = make(chan outChanReg)
 	c.frameChan = make(chan frame, 100)
+	exitCh := make(chan struct{})
 
 	bretry := !c.noReConnect
 	var once sync.Once
 	exitfun := func() {
-		close(c.exiting)
-		go func() {
-			for attempts := 0; bretry && c.connFactory != nil; attempts++ {
-				time.Sleep(time.Second * time.Duration(attempts+1))
-				conn, err := c.connFactory()
-				log.Infow("websocket connection retry", "error", err)
-				if err != nil {
-					continue
+		close(exitCh)
+		if bretry && c.isClient && c.connFactory != nil {
+			go func() {
+				for attempts := 0; true; attempts++ {
+					time.Sleep(time.Second * time.Duration(attempts+1))
+					conn, err := c.connFactory()
+					log.Infow("websocket connection retry", "error", err)
+					if err != nil {
+						continue
+					}
+					c.conn = conn
+					c.handleWsConn(ctx)
+					break
 				}
-				c.conn = conn
-				c.handleWsConn(ctx)
-				break
-			}
-		}()
+			}()
+		}
 	}
 
 	// ////
@@ -452,18 +458,23 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	defer c.closeInFlight()
 	defer c.closeChans()
 	defer c.conn.Close()
+	defer func() {
+		if !(bretry && c.isClient && c.connFactory != nil) {
+			close(c.exiting)
+		}
+	}()
 
 	// 发送消息的协程
 	go func() {
 		var ptmr <-chan time.Time
-		if c.pingInterval > 0 {
+		if c.pingInterval > 0 && c.isClient {
 			ptmr = time.NewTicker(c.pingInterval).C
 		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-c.exiting:
+			case <-exitCh:
 				return
 			case <-ptmr:
 				msg, _ := json.Marshal(request{
@@ -502,17 +513,16 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-c.exiting:
+		case <-exitCh:
 			return
 		default:
 			if c.pingInterval > 0 {
-				c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
+				c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 3))
 			}
 			_, data, err := c.conn.ReadMessage()
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					log.Errorf("read message error, %v, %v", c.conn.RemoteAddr(), err)
-					bretry = c.noReConnect && true
 				} else {
 					bretry = false
 				}

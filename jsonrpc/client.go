@@ -116,7 +116,7 @@ func NewMergeClient(ctx context.Context, addr string, namespace string, outs []i
 
 	stop := make(chan struct{})
 	exiting := make(chan struct{})
-	c.requests = make(chan clientRequest)
+	c.requests = make(chan clientRequest, 100)
 	c.exiting = exiting
 
 	go (&wsConn{
@@ -130,6 +130,7 @@ func NewMergeClient(ctx context.Context, addr string, namespace string, outs []i
 		requests:         c.requests,
 		stop:             stop,
 		exiting:          exiting,
+		isClient:         true,
 	}).handleWsConn(ctx)
 
 	for _, handler := range outs {
