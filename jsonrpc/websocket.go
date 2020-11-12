@@ -15,6 +15,8 @@ import (
 const wsCancel = "xrpc.cancel"
 const chValue = "xrpc.ch.val"
 const chClose = "xrpc.ch.close"
+const wsPing = "xrpc.ping"
+const wsPong = "xrpc.pong"
 
 type frame struct {
 	// common
@@ -48,6 +50,7 @@ type wsConn struct {
 	noReConnect      bool
 	handler          *RPCServer
 	requests         <-chan clientRequest
+	frameChan        chan frame
 
 	stop    <-chan struct{}
 	exiting chan struct{}
@@ -365,6 +368,14 @@ func (c *wsConn) handleFrame(ctx context.Context, frame frame) {
 		c.handleResponse(frame)
 	case wsCancel:
 		c.cancelCtx(frame)
+	case wsPing:
+		msg, _ := json.Marshal(request{
+			Jsonrpc: "2.0",
+			Method:  wsPong,
+		})
+		c.writeChan <- msg
+	case wsPong:
+		return
 	case chValue:
 		c.handleChanMessage(frame)
 	case chClose:
@@ -413,16 +424,18 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	c.chanHandlers = map[uint64]func(m []byte, ok bool){}
 	c.writeChan = make(chan []byte, 100)
 	c.registerCh = make(chan outChanReg)
+	c.frameChan = make(chan frame, 100)
 
+	bretry := !c.noReConnect
 	var once sync.Once
 	exitfun := func() {
 		close(c.exiting)
 		go func() {
-			for attempts := 0; !c.noReConnect; attempts++ {
+			for attempts := 0; bretry; attempts++ {
 				time.Sleep(c.reconnectBackoff.next(attempts))
 				conn, err := c.connFactory()
+				log.Infow("websocket connection retry", "error", err)
 				if err != nil {
-					log.Debugw("websocket connection retry failed", "error", err)
 					continue
 				}
 				c.conn = conn
@@ -453,7 +466,11 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			case <-c.exiting:
 				return
 			case <-ptmr:
-				c.conn.WriteMessage(websocket.TextMessage, []byte("ping"))
+				msg, _ := json.Marshal(request{
+					Jsonrpc: "2.0",
+					Method:  wsPing,
+				})
+				c.writeChan <- msg
 			case data := <-c.writeChan:
 				err := c.conn.WriteMessage(websocket.TextMessage, data)
 				if err != nil {
@@ -467,12 +484,14 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 				}
 				msg, _ := json.Marshal(req.req)
 				c.writeChan <- msg
+			case fm := <-c.frameChan:
+				c.handleFrame(ctx, fm)
 			case <-c.stop:
-				cmsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+				cmsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "stop")
 				if err := c.conn.WriteMessage(websocket.CloseMessage, cmsg); err != nil {
 					log.Warn("failed to write close message: ", err)
 				}
-				c.noReConnect = true
+				bretry = false
 				once.Do(exitfun)
 				return
 			}
@@ -491,17 +510,14 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			}
 			_, data, err := c.conn.ReadMessage()
 			if err != nil {
-				log.Errorf("read message error, %v, %v", c.conn.RemoteAddr(), err)
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+					log.Errorf("read message error, %v, %v", c.conn.RemoteAddr(), err)
+					bretry = c.noReConnect && true
+				} else {
+					bretry = false
+				}
 				once.Do(exitfun)
 				return
-			}
-			if len(data) == 4 {
-				if string(data) == "ping" {
-					c.writeChan <- []byte("pong")
-					continue
-				} else if string(data) == "pong" {
-					continue
-				}
 			}
 
 			var frame frame
@@ -510,7 +526,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 				continue
 			}
 
-			c.handleFrame(ctx, frame)
+			c.frameChan <- frame
 		}
 	}
 }
