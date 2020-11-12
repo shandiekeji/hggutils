@@ -431,8 +431,8 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	exitfun := func() {
 		close(c.exiting)
 		go func() {
-			for attempts := 0; bretry; attempts++ {
-				time.Sleep(c.reconnectBackoff.next(attempts))
+			for attempts := 0; bretry && c.connFactory != nil; attempts++ {
+				time.Sleep(time.Second * time.Duration(attempts+1))
 				conn, err := c.connFactory()
 				log.Infow("websocket connection retry", "error", err)
 				if err != nil {
