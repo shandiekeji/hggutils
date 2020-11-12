@@ -374,11 +374,12 @@ func (c *wsConn) handleFrame(ctx context.Context, frame frame) {
 		msg, _ := json.Marshal(request{
 			Jsonrpc: "2.0",
 			Method:  wsPong,
+			Params:  []param{{v: reflect.ValueOf(time.Now().Format(time.RFC3339))}},
 		})
 		c.keepAliveChan <- msg
-		log.Infow("ping", "remote", c.conn.RemoteAddr().String())
+		log.Infow("ping", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
 	case wsPong:
-		log.Infow("pong", "remote", c.conn.RemoteAddr().String())
+		log.Infow("pong", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
 		return
 	case chValue:
 		c.handleChanMessage(frame)
@@ -482,15 +483,9 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 				msg, _ := json.Marshal(request{
 					Jsonrpc: "2.0",
 					Method:  wsPing,
+					Params:  []param{{v: reflect.ValueOf(time.Now().Format(time.RFC3339))}},
 				})
 				c.keepAliveChan <- msg
-			case data := <-c.writeChan:
-				err := c.conn.WriteMessage(websocket.TextMessage, data)
-				if err != nil {
-					log.Errorf("write message error, %v, %v", c.conn.RemoteAddr(), err)
-					once.Do(exitfun)
-					return
-				}
 			case data := <-c.keepAliveChan:
 				err := c.conn.WriteMessage(websocket.TextMessage, data)
 				if err != nil {
@@ -499,6 +494,13 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 					return
 				}
 				log.Infow("send", "remote", c.conn.RemoteAddr().String(), "data", string(data))
+			case data := <-c.writeChan:
+				err := c.conn.WriteMessage(websocket.TextMessage, data)
+				if err != nil {
+					log.Errorf("write message error, %v, %v", c.conn.RemoteAddr(), err)
+					once.Do(exitfun)
+					return
+				}
 			case req := <-c.requests:
 				if req.req.ID != nil {
 					c.inflight[*req.req.ID] = req
