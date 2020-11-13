@@ -421,9 +421,6 @@ func (c *wsConn) closeChans() {
 }
 
 func (c *wsConn) handleWsConn(ctx context.Context) {
-	if c.pingInterval <= 0 {
-		c.pingInterval = time.Second * 10
-	}
 	c.inflight = map[int64]clientRequest{}
 	c.handling = map[int64]context.CancelFunc{}
 	c.chanHandlers = map[uint64]func(m []byte, ok bool){}
