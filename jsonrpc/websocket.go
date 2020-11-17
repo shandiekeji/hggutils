@@ -377,9 +377,9 @@ func (c *wsConn) handleFrame(ctx context.Context, frame frame) {
 			Params:  []param{{v: reflect.ValueOf(time.Now().Format(time.RFC3339))}},
 		})
 		c.keepAliveChan <- msg
-		log.Infow("ping", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
+		//log.Infow("ping", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
 	case wsPong:
-		log.Infow("pong", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
+		//log.Infow("pong", "remote", c.conn.RemoteAddr().String(), "time", frame.Params)
 		return
 	case chValue:
 		c.handleChanMessage(frame)
