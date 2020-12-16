@@ -490,7 +490,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 					once.Do(exitfun)
 					return
 				}
-				log.Infow("send", "remote", c.conn.RemoteAddr().String(), "data", string(data))
+				//log.Infow("send", "remote", c.conn.RemoteAddr().String(), "data", string(data))
 			case data := <-c.writeChan:
 				err := c.conn.WriteMessage(websocket.TextMessage, data)
 				if err != nil {
