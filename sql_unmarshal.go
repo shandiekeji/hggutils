@@ -116,13 +116,13 @@ func (slf *SQLDecoder) mapSingle2interface(m map[string]string, v reflect.Value)
 					return err
 				}
 				value.SetFloat(f)
-			case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 				integer64, err := strconv.ParseInt(meta, 10, 64)
 				if err != nil {
 					return err
 				}
 				value.SetInt(integer64)
-			case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 				integer64, err := strconv.ParseUint(meta, 10, 64)
 				if err != nil {
 					return err
