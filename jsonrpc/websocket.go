@@ -53,6 +53,7 @@ type wsConn struct {
 	frameChan        chan frame
 
 	isClient bool
+	isStoped bool
 	stop     <-chan struct{}
 	exiting  chan struct{}
 
@@ -434,9 +435,9 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	var once sync.Once
 	exitfun := func() {
 		close(exitCh)
-		if bretry && c.isClient && c.connFactory != nil {
+		if bretry && c.isClient {
 			go func() {
-				for attempts := 0; true; attempts++ {
+				for attempts := 0; !c.isStoped; attempts++ {
 					time.Sleep(time.Second * time.Duration(attempts+1))
 					conn, err := c.connFactory()
 					log.Infow("websocket connection retry", "error", err)
@@ -445,9 +446,12 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 					}
 					c.conn = conn
 					c.handleWsConn(ctx)
-					break
+					return
 				}
+				close(c.exiting)
 			}()
+		} else {
+			close(c.exiting)
 		}
 	}
 
@@ -458,11 +462,6 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	defer c.closeInFlight()
 	defer c.closeChans()
 	defer c.conn.Close()
-	defer func() {
-		if !(bretry && c.isClient && c.connFactory != nil) {
-			close(c.exiting)
-		}
-	}()
 
 	// 发送消息的协程
 	go func() {

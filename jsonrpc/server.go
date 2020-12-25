@@ -19,7 +19,13 @@ const (
 type RPCServer struct {
 	methods map[string]rpcHandler
 
+	// aliasedMethods contains a map of alias:original method names.
+	// These are used as fallbacks if a method is not found by the given method name.
+	aliasedMethods map[string]string
+
 	paramDecoders map[reflect.Type]ParamDecoder
+
+	maxRequestSize int64
 }
 
 // NewServer creates new RPCServer instance
@@ -30,8 +36,10 @@ func NewServer(opts ...ServerOption) *RPCServer {
 	}
 
 	return &RPCServer{
-		methods:       map[string]rpcHandler{},
-		paramDecoders: config.paramDecoders,
+		methods:        map[string]rpcHandler{},
+		aliasedMethods: map[string]string{},
+		paramDecoders:  config.paramDecoders,
+		maxRequestSize: config.maxRequestSize,
 	}
 }
 
@@ -59,6 +67,7 @@ func (s *RPCServer) handleWS(ctx context.Context, w http.ResponseWriter, r *http
 	(&wsConn{
 		conn:        c,
 		noReConnect: true,
+		isClient:    false,
 		handler:     s,
 		exiting:     make(chan struct{}),
 	}).handleWsConn(ctx)
@@ -105,6 +114,10 @@ func rpcError(wrtfun func(interface{}), req *request, code int, err error) {
 // Handler is any value with methods defined
 func (s *RPCServer) Register(namespace string, handler interface{}) {
 	s.register(namespace, handler)
+}
+
+func (s *RPCServer) AliasMethod(alias, original string) {
+	s.aliasedMethods[alias] = original
 }
 
 var _ error = &respError{}
