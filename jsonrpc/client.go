@@ -496,10 +496,16 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 		retVal, chCtor = fn.client.makeOutChan(ctx, fn.ftyp, fn.valOut)
 	}
 
+	method := ""
+	if fn.client.namespace == "" {
+		method = fn.name
+	} else {
+		method = fn.client.namespace + "." + fn.name
+	}
 	req := request{
 		Jsonrpc: "2.0",
 		ID:      &id,
-		Method:  fn.client.namespace + "." + fn.name,
+		Method:  method,
 		Params:  params,
 	}
 
@@ -562,10 +568,15 @@ func (c *client) makeRpcFunc(f reflect.StructField) (reflect.Value, error) {
 		return reflect.Value{}, xerrors.New("handler field not a func")
 	}
 
+	fname := f.Tag.Get("alias")
+	if fname == "" {
+		fname = f.Name
+	}
+
 	fun := &rpcFunc{
 		client: c,
 		ftyp:   ftyp,
-		name:   f.Name,
+		name:   fname,
 		retry:  f.Tag.Get("retry") == "true",
 	}
 	fun.valOut, fun.errOut, fun.nout = processFuncOut(ftyp)
