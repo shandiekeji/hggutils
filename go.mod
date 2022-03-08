@@ -1,4 +1,4 @@
-module gitee.com/huanghua_2017/hggutils
+module github.com/shandiekeji/hggutils
 
 go 1.14
 
